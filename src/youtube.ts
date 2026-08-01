@@ -36,17 +36,60 @@ const MAX_TRANSCRIPT_CHARS = 90_000;
 const MAX_DESCRIPTION_CHARS = 2_000;
 
 const PLAYER_ENDPOINT = "https://www.youtube.com/youtubei/v1/player";
+
 /**
- * The client this server claims to be. A version YouTube has retired starts
- * failing with an explicit playability error, not silently — bump it here
- * when that day comes.
+ * The clients this server can claim to be, tried in order.
+ *
+ * One client is not enough in production: YouTube challenges datacenter egress
+ * IPs per client (`LOGIN_REQUIRED: Sign in to confirm you're not a bot`), and
+ * which client survives varies by IP reputation and time — the same chain
+ * yt-dlp walks for the same reason. Android first because its caption URLs are
+ * not token-gated; iOS second as a differently-treated primary surface; the TV
+ * embedded player last, because it also answers ERROR for every video whose
+ * owner disabled embedding — a real fallback, but one that fails on content
+ * the others serve fine. A version YouTube has retired starts failing with an
+ * explicit playability error, not silently — bump it here when that day comes.
  */
-const ANDROID_CLIENT = { clientName: "ANDROID", clientVersion: "20.10.38", androidSdkVersion: 30 };
-const ANDROID_HEADERS = {
-  "content-type": "application/json",
-  "user-agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip",
-  "accept-language": "en-US,en;q=0.9",
-} as const;
+const CLIENTS: ReadonlyArray<{
+  label: string;
+  client: Record<string, unknown>;
+  thirdParty?: { embedUrl: string };
+  userAgent: string;
+}> = [
+  {
+    label: "android",
+    client: { clientName: "ANDROID", clientVersion: "20.10.38", androidSdkVersion: 30 },
+    userAgent: "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip",
+  },
+  {
+    label: "ios",
+    client: {
+      clientName: "IOS",
+      clientVersion: "20.10.4",
+      deviceMake: "Apple",
+      deviceModel: "iPhone16,2",
+      osName: "iPhone",
+      osVersion: "18.3.2.22D82",
+    },
+    userAgent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+  },
+  {
+    label: "tv-embedded",
+    client: { clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER", clientVersion: "2.0" },
+    thirdParty: { embedUrl: "https://www.google.com" },
+    userAgent:
+      "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15 " +
+      "(KHTML, like Gecko) Version/13.0 Safari/605.1.15",
+  },
+];
+
+function clientHeaders(userAgent: string): Record<string, string> {
+  return {
+    "content-type": "application/json",
+    "user-agent": userAgent,
+    "accept-language": "en-US,en;q=0.9",
+  };
+}
 
 export interface ToolResult {
   videoId: string;
@@ -63,13 +106,14 @@ async function requestYoutube(
   fetchImpl: Fetcher,
   url: string,
   init: RequestInit,
+  headers: Record<string, string>,
   what: string,
 ): Promise<Response> {
   let response: Response;
   try {
     response = await fetchImpl(url, {
       ...init,
-      headers: ANDROID_HEADERS,
+      headers,
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (error) {
@@ -85,24 +129,26 @@ async function requestYoutube(
   return response;
 }
 
-async function loadPlayer(
-  input: string,
+/** One client's attempt: the player data, or the refusal to try the next client past. */
+async function playerAs(
+  clientSpec: (typeof CLIENTS)[number],
+  videoId: string,
   fetchImpl: Fetcher,
-): Promise<{ videoId: string; player: PlayerData }> {
-  const videoId = parseVideoId(input);
-  if (!videoId) {
-    throw new YoutubeError(
-      "not a YouTube video link or id — expected a watch/youtu.be/shorts/live URL " +
-        "or an 11-character video id",
-    );
-  }
+): Promise<PlayerData> {
   const response = await requestYoutube(
     fetchImpl,
     PLAYER_ENDPOINT,
     {
       method: "POST",
-      body: JSON.stringify({ context: { client: { ...ANDROID_CLIENT, hl: "en" } }, videoId }),
+      body: JSON.stringify({
+        context: {
+          client: { ...clientSpec.client, hl: "en" },
+          ...(clientSpec.thirdParty ? { thirdParty: clientSpec.thirdParty } : {}),
+        },
+        videoId,
+      }),
     },
+    clientHeaders(clientSpec.userAgent),
     "player request",
   );
   let parsed: unknown;
@@ -115,14 +161,55 @@ async function loadPlayer(
   if (!player) {
     throw new YoutubeError("could not read YouTube's player response");
   }
-  const status = player.playabilityStatus?.status;
-  if (status && status !== "OK") {
-    const reason = player.playabilityStatus?.reason;
+  return player;
+}
+
+async function loadPlayer(
+  input: string,
+  fetchImpl: Fetcher,
+): Promise<{ videoId: string; player: PlayerData; client: (typeof CLIENTS)[number] }> {
+  const videoId = parseVideoId(input);
+  if (!videoId) {
     throw new YoutubeError(
-      `the video is not playable (${status})${reason ? `: ${reason}` : ""}`,
+      "not a YouTube video link or id — expected a watch/youtu.be/shorts/live URL " +
+        "or an 11-character video id",
     );
   }
-  return { videoId, player };
+  // Walk the client chain: any non-OK answer is a reason to ask as someone
+  // else, because the gates are per client. The first refusal is what gets
+  // reported when nobody succeeds — it names the primary client's problem,
+  // which is the one an operator should reason from.
+  let firstRefusal: YoutubeError | undefined;
+  for (const clientSpec of CLIENTS) {
+    let player: PlayerData;
+    try {
+      player = await playerAs(clientSpec, videoId, fetchImpl);
+    } catch (error) {
+      if (!(error instanceof YoutubeError)) {
+        throw error;
+      }
+      firstRefusal ??= error;
+      continue;
+    }
+    const status = player.playabilityStatus?.status;
+    if (status && status !== "OK") {
+      const reason = player.playabilityStatus?.reason;
+      firstRefusal ??= new YoutubeError(
+        `the video is not playable (${status})${reason ? `: ${reason}` : ""}`,
+      );
+      continue;
+    }
+    return { videoId, player, client: clientSpec };
+  }
+  const refusal = firstRefusal ?? new YoutubeError("could not read YouTube's player response");
+  const botChallenged = /LOGIN_REQUIRED|confirm you.re not a bot/i.test(refusal.message);
+  throw new YoutubeError(
+    `${refusal.message} — tried the ${CLIENTS.map((c) => c.label).join(", ")} clients` +
+      (botChallenged
+        ? ". YouTube is challenging this server's egress IP (datacenter addresses often are);" +
+          " the durable fixes are operational — egress with better reputation, or cookies"
+        : ""),
+  );
 }
 
 /** Title, channel, duration, dates, and which transcript languages exist. */
@@ -164,7 +251,7 @@ export async function getTranscript(
   language: string | undefined,
   fetchImpl: Fetcher = fetch,
 ): Promise<ToolResult> {
-  const { videoId, player } = await loadPlayer(input, fetchImpl);
+  const { videoId, player, client } = await loadPlayer(input, fetchImpl);
   const track = selectTrack(player.tracks, language);
   if ("error" in track) {
     throw new YoutubeError(track.error);
@@ -184,7 +271,15 @@ export async function getTranscript(
   }
   captionsUrl.searchParams.set("fmt", "json3");
   const raw = await (
-    await requestYoutube(fetchImpl, captionsUrl.href, { method: "GET" }, "caption track")
+    // The same identity that won the player request: a caption URL is issued
+    // to the client that asked, and mixing identities re-invites the gate.
+    await requestYoutube(
+      fetchImpl,
+      captionsUrl.href,
+      { method: "GET" },
+      clientHeaders(client.userAgent),
+      "caption track",
+    )
   ).text();
   let parsed: unknown;
   try {

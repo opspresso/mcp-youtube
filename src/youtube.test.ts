@@ -36,19 +36,34 @@ const CAPTIONS = {
   ],
 };
 
-/** A fetcher serving the two requests the server is allowed to make. */
+/**
+ * A fetcher serving the requests the server is allowed to make. `playerFor`
+ * answers per innertube client name, so a test can gate one client and let
+ * the next one through — the exact shape of the production failure.
+ */
 function fakeFetch(
   requested: string[],
-  overrides: { player?: unknown; captionsBody?: string } = {},
+  overrides: {
+    player?: unknown;
+    playerFor?: Record<string, unknown>;
+    captionsBody?: string;
+  } = {},
 ): (url: string, init?: RequestInit) => Promise<Response> {
   return async (url: string, init?: RequestInit) => {
-    requested.push(url);
     if (url === "https://www.youtube.com/youtubei/v1/player") {
       // The id travels in the POST body — the endpoint is fixed.
       assert.equal(init?.method, "POST");
-      assert.equal((JSON.parse(String(init?.body)) as { videoId: string }).videoId, ID);
-      return new Response(JSON.stringify(overrides.player ?? PLAYER), { status: 200 });
+      const body = JSON.parse(String(init?.body)) as {
+        videoId: string;
+        context: { client: { clientName: string } };
+      };
+      assert.equal(body.videoId, ID);
+      const clientName = body.context.client.clientName;
+      requested.push(`player:${clientName}`);
+      const player = overrides.playerFor?.[clientName] ?? overrides.player ?? PLAYER;
+      return new Response(JSON.stringify(player), { status: 200 });
     }
+    requested.push(url);
     if (url.startsWith("https://www.youtube.com/api/timedtext")) {
       assert.match(url, /fmt=json3/);
       return new Response(overrides.captionsBody ?? JSON.stringify(CAPTIONS), { status: 200 });
@@ -56,6 +71,11 @@ function fakeFetch(
     return new Response("not found", { status: 404 });
   };
 }
+
+const BOT_GATED = {
+  ...PLAYER,
+  playabilityStatus: { status: "LOGIN_REQUIRED", reason: "Sign in to confirm you're not a bot" },
+};
 
 test("video info is one player request and reports the transcript languages", async () => {
   const requested: string[] = [];
@@ -101,6 +121,29 @@ test("an empty caption body is named for what it is, not a JSON error", async ()
     getTranscript(ID, undefined, fakeFetch([], { captionsBody: "" })),
     /empty caption response/,
   );
+});
+
+test("a client the bot gate refuses is walked past, not surrendered to", async () => {
+  // The production failure: a datacenter egress IP gets LOGIN_REQUIRED from
+  // the primary client while another client still answers.
+  const requested: string[] = [];
+  const { body } = await getTranscript(
+    ID,
+    undefined,
+    fakeFetch(requested, { playerFor: { ANDROID: BOT_GATED } }),
+  );
+  assert.deepEqual(requested.slice(0, 2), ["player:ANDROID", "player:IOS"]);
+  assert.match(body, /\[0:00\] welcome to the talk/);
+});
+
+test("when every client is refused, the error names them and the egress IP", async () => {
+  await assert.rejects(getTranscript(ID, undefined, fakeFetch([], { player: BOT_GATED })), (error: unknown) => {
+    assert.ok(error instanceof YoutubeError);
+    assert.match(error.message, /LOGIN_REQUIRED/);
+    assert.match(error.message, /tried the android, ios, tv-embedded clients/);
+    assert.match(error.message, /egress IP/);
+    return true;
+  });
 });
 
 test("an unplayable video reports YouTube's reason instead of an empty transcript", async () => {
