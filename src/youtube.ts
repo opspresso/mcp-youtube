@@ -2,14 +2,21 @@
  * The two questions this server answers about a YouTube link: what is this
  * video, and what was said in it.
  *
- * Both are answered by the innertube `player` endpoint, asked for as the
- * ANDROID client (see `playerResponse.ts` for why the web path is a trap).
- * Neither ever fetches the caller's URL: an id is parsed out of it and every
- * request goes to youtube.com. The caption payload's own URL is checked
- * against that same boundary — it arrives inside YouTube's response, but
- * "data said so" is not a reason to send a request somewhere new.
+ * The transcript is answered by the innertube `player` endpoint, asked for as
+ * the ANDROID client (see `playerResponse.ts` for why the web path is a
+ * trap). The metadata rides the same response — unless a Data API key is
+ * configured, in which case it moves to the official API and out of reach of
+ * the bot gate (see `dataApi.ts`). Neither ever fetches the caller's URL: an
+ * id is parsed out of it and every request goes to youtube.com or
+ * googleapis.com. The caption payload's own URL is checked against that same
+ * boundary — it arrives inside YouTube's response, but "data said so" is not
+ * a reason to send a request somewhere new.
  */
 
+import {
+  parseCaptionsListResponse,
+  parseVideosListResponse,
+} from "./dataApi.js";
 import {
   describeTrack,
   parsePlayerResponse,
@@ -36,6 +43,7 @@ const MAX_TRANSCRIPT_CHARS = 90_000;
 const MAX_DESCRIPTION_CHARS = 2_000;
 
 const PLAYER_ENDPOINT = "https://www.youtube.com/youtubei/v1/player";
+const DATA_API_ORIGIN = "https://www.googleapis.com";
 
 /**
  * The clients this server can claim to be, tried in order.
@@ -164,10 +172,7 @@ async function playerAs(
   return player;
 }
 
-async function loadPlayer(
-  input: string,
-  fetchImpl: Fetcher,
-): Promise<{ videoId: string; player: PlayerData; client: (typeof CLIENTS)[number] }> {
+function requireVideoId(input: string): string {
   const videoId = parseVideoId(input);
   if (!videoId) {
     throw new YoutubeError(
@@ -175,6 +180,14 @@ async function loadPlayer(
         "or an 11-character video id",
     );
   }
+  return videoId;
+}
+
+async function loadPlayer(
+  input: string,
+  fetchImpl: Fetcher,
+): Promise<{ videoId: string; player: PlayerData; client: (typeof CLIENTS)[number] }> {
+  const videoId = requireVideoId(input);
   // Walk the client chain: any non-OK answer is a reason to ask as someone
   // else, because the gates are per client. The first refusal is what gets
   // reported when nobody succeeds — it names the primary client's problem,
@@ -212,37 +225,162 @@ async function loadPlayer(
   );
 }
 
-/** Title, channel, duration, dates, and which transcript languages exist. */
-export async function getVideoInfo(
-  input: string,
-  fetchImpl: Fetcher = fetch,
-): Promise<ToolResult> {
-  const { videoId, player } = await loadPlayer(input, fetchImpl);
-  const description = player.shortDescription ?? "";
-  const cut = description.length > MAX_DESCRIPTION_CHARS;
+/** What both metadata roads produce, so the model reads one shape of answer. */
+interface VideoInfoFields {
+  title?: string;
+  author?: string;
+  /** Already worded: `live`, `1:01:40`, or `(unknown)`. */
+  duration: string;
+  publishDate?: string;
+  viewCount?: number;
+  /** Already worded: `en, ko (auto)`, `none`, or `(could not be listed)`. */
+  languages: string;
+  description: string;
+}
+
+function videoInfoResult(videoId: string, fields: VideoInfoFields): ToolResult {
+  const cut = fields.description.length > MAX_DESCRIPTION_CHARS;
   const lines = [
-    `Title: ${player.title ?? "(unknown)"}`,
-    `Channel: ${player.author ?? "(unknown)"}`,
-    `Duration: ${
-      player.isLive ? "live" : player.lengthSeconds ? formatTimestamp(player.lengthSeconds * 1000) : "(unknown)"
-    }`,
-    ...(player.publishDate ? [`Published: ${player.publishDate}`] : []),
-    ...(player.viewCount !== undefined
-      ? [`Views: ${player.viewCount.toLocaleString("en-US")}`]
+    `Title: ${fields.title ?? "(unknown)"}`,
+    `Channel: ${fields.author ?? "(unknown)"}`,
+    `Duration: ${fields.duration}`,
+    ...(fields.publishDate ? [`Published: ${fields.publishDate}`] : []),
+    ...(fields.viewCount !== undefined
+      ? [`Views: ${fields.viewCount.toLocaleString("en-US")}`]
       : []),
     `Watch URL: ${watchUrl(videoId)}`,
-    `Transcript languages: ${
-      player.tracks.length > 0 ? player.tracks.map(describeTrack).join(", ") : "none"
-    }`,
+    `Transcript languages: ${fields.languages}`,
     "",
     "Description:",
-    description ? description.slice(0, MAX_DESCRIPTION_CHARS) : "(none)",
+    fields.description ? fields.description.slice(0, MAX_DESCRIPTION_CHARS) : "(none)",
   ];
   return {
     videoId,
     body: lines.join("\n"),
     ...(cut ? { note: `description truncated to ${MAX_DESCRIPTION_CHARS} characters` } : {}),
   };
+}
+
+async function requestDataApi(fetchImpl: Fetcher, url: string, what: string): Promise<unknown> {
+  let response: Response;
+  try {
+    response = await fetchImpl(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+  } catch (error) {
+    const timedOut =
+      error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
+    throw new YoutubeError(
+      timedOut ? `the ${what} request timed out` : `the ${what} request failed`,
+    );
+  }
+  if (!response.ok) {
+    // The Data API says *why* in the body — a bad key and an exhausted quota
+    // are both 403s, and an operator needs to know which. The URL never goes
+    // in the message: it carries the key.
+    throw new YoutubeError(
+      `the Data API answered ${response.status} for the ${what}${await dataApiReason(response)}`,
+    );
+  }
+  try {
+    return await response.json();
+  } catch {
+    throw new YoutubeError(`the Data API's ${what} response was not JSON`);
+  }
+}
+
+async function dataApiReason(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as {
+      error?: { errors?: Array<{ reason?: string }>; message?: string };
+    };
+    const reason = body.error?.errors?.[0]?.reason ?? body.error?.message;
+    return reason ? ` (${reason})` : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * The keyed road to the metadata: the official Data API, which datacenter
+ * egress IPs are not bot-gated out of. See `dataApi.ts` for why the transcript
+ * itself cannot travel this road.
+ */
+async function videoInfoViaDataApi(
+  videoId: string,
+  apiKey: string,
+  fetchImpl: Fetcher,
+): Promise<ToolResult> {
+  const key = encodeURIComponent(apiKey);
+  const videosUrl =
+    `${DATA_API_ORIGIN}/youtube/v3/videos?part=snippet,contentDetails,statistics` +
+    `&id=${videoId}&key=${key}`;
+  const captionsUrl = `${DATA_API_ORIGIN}/youtube/v3/captions?part=snippet&videoId=${videoId}&key=${key}`;
+  // The caption listing costs 50 quota units to the video lookup's 1 and can
+  // fail on its own; when it does, one line of the answer degrades rather
+  // than the whole answer failing.
+  const [videos, captions] = await Promise.all([
+    requestDataApi(fetchImpl, videosUrl, "video info"),
+    requestDataApi(fetchImpl, captionsUrl, "caption list").catch((error: unknown) => {
+      if (error instanceof YoutubeError) {
+        return null;
+      }
+      throw error;
+    }),
+  ]);
+  const listed = parseVideosListResponse(videos);
+  if (!listed) {
+    throw new YoutubeError("could not read the Data API's video response");
+  }
+  if ("missing" in listed) {
+    throw new YoutubeError("YouTube does not list this video (removed, private, or a wrong id)");
+  }
+  const info = listed.video;
+  const labels = captions === null ? null : parseCaptionsListResponse(captions);
+  return videoInfoResult(videoId, {
+    ...(info.title ? { title: info.title } : {}),
+    ...(info.author ? { author: info.author } : {}),
+    duration: info.isLive
+      ? "live"
+      : info.lengthSeconds
+        ? formatTimestamp(info.lengthSeconds * 1000)
+        : "(unknown)",
+    ...(info.publishDate ? { publishDate: info.publishDate } : {}),
+    ...(info.viewCount !== undefined ? { viewCount: info.viewCount } : {}),
+    languages:
+      labels === null ? "(could not be listed)" : labels.length > 0 ? labels.join(", ") : "none",
+    description: info.description,
+  });
+}
+
+/**
+ * Title, channel, duration, dates, and which transcript languages exist.
+ *
+ * With an API key this is answered by the Data API and never touches
+ * innertube — the one tool that can be made immune to the bot gate, is.
+ * Keyless, it rides the same player response the transcript path uses.
+ */
+export async function getVideoInfo(
+  input: string,
+  fetchImpl: Fetcher = fetch,
+  apiKey?: string,
+): Promise<ToolResult> {
+  if (apiKey) {
+    return videoInfoViaDataApi(requireVideoId(input), apiKey, fetchImpl);
+  }
+  const { videoId, player } = await loadPlayer(input, fetchImpl);
+  return videoInfoResult(videoId, {
+    ...(player.title ? { title: player.title } : {}),
+    ...(player.author ? { author: player.author } : {}),
+    duration: player.isLive
+      ? "live"
+      : player.lengthSeconds
+        ? formatTimestamp(player.lengthSeconds * 1000)
+        : "(unknown)",
+    ...(player.publishDate ? { publishDate: player.publishDate } : {}),
+    ...(player.viewCount !== undefined ? { viewCount: player.viewCount } : {}),
+    languages:
+      player.tracks.length > 0 ? player.tracks.map(describeTrack).join(", ") : "none",
+    description: player.shortDescription ?? "",
+  });
 }
 
 /** The transcript as timestamped lines, from the best track for `language`. */

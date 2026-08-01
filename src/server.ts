@@ -22,6 +22,12 @@ const PROTOCOL_VERSION = "2025-06-18";
 const PORT = Number(process.env.PORT ?? 3000);
 /** Shared secret callers must present. Unset means no authentication — see `auth.ts`. */
 const API_KEY = process.env.MCP_API_KEY;
+/**
+ * A YouTube Data API v3 key. Set, it moves `get_video_info` onto the official
+ * API — out of reach of the bot gate innertube runs into on datacenter egress
+ * IPs. Unset, metadata rides the same innertube response transcripts use.
+ */
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const MAX_BODY_BYTES = 64 * 1024;
 
 interface JsonRpcRequest {
@@ -108,7 +114,7 @@ async function callTool(
     const result =
       name === "get_transcript"
         ? await getTranscript(args.url, language)
-        : await getVideoInfo(args.url);
+        : await getVideoInfo(args.url, fetch, YOUTUBE_API_KEY);
     return { content: [{ type: "text", text: asUntrustedContent(result) }] };
   } catch (error) {
     // A failed lookup is the model's problem to react to, not the run's, so it
@@ -257,6 +263,13 @@ server.listen(PORT, () => {
   } else {
     console.warn(notice);
   }
+  // Which road metadata takes, stated like the auth mode is: an operator
+  // asking "why is get_video_info bot-gated" should find the answer here.
+  console.log(
+    YOUTUBE_API_KEY
+      ? "get_video_info: YouTube Data API v3 (keyed)"
+      : "get_video_info: innertube (no YOUTUBE_API_KEY; datacenter egress may hit the bot gate)",
+  );
 });
 
 for (const signal of ["SIGTERM", "SIGINT"] as const) {

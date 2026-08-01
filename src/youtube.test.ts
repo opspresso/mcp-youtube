@@ -172,3 +172,93 @@ test("a missing language names the ones that exist", async () => {
     /no "ja" transcript; available languages: en \(auto\)/,
   );
 });
+
+const VIDEOS_LIST = {
+  items: [
+    {
+      snippet: {
+        title: "A talk",
+        channelTitle: "A channel",
+        description: "What the talk covers.",
+        publishedAt: "2024-05-01T12:34:56Z",
+        liveBroadcastContent: "none",
+      },
+      contentDetails: { duration: "PT1H1M40S" },
+      statistics: { viewCount: "12345" },
+    },
+  ],
+};
+
+const CAPTIONS_LIST = { items: [{ snippet: { language: "en", trackKind: "asr" } }] };
+
+/** A fetcher answering only as the Data API — innertube traffic is a failure. */
+function fakeDataApi(
+  requested: string[],
+  overrides: { videos?: unknown; videosStatus?: number; captionsStatus?: number } = {},
+): (url: string, init?: RequestInit) => Promise<Response> {
+  const refusal = JSON.stringify({ error: { errors: [{ reason: "quotaExceeded" }] } });
+  return async (url: string) => {
+    const parsed = new URL(url);
+    requested.push(parsed.pathname);
+    assert.equal(parsed.origin, "https://www.googleapis.com");
+    assert.equal(parsed.searchParams.get("key"), "test-key");
+    if (parsed.pathname === "/youtube/v3/videos") {
+      assert.equal(parsed.searchParams.get("id"), ID);
+      if (overrides.videosStatus) {
+        return new Response(refusal, { status: overrides.videosStatus });
+      }
+      return new Response(JSON.stringify(overrides.videos ?? VIDEOS_LIST), { status: 200 });
+    }
+    if (parsed.pathname === "/youtube/v3/captions") {
+      assert.equal(parsed.searchParams.get("videoId"), ID);
+      if (overrides.captionsStatus) {
+        return new Response(refusal, { status: overrides.captionsStatus });
+      }
+      return new Response(JSON.stringify(CAPTIONS_LIST), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+}
+
+test("with a Data API key, video info never touches innertube", async () => {
+  const requested: string[] = [];
+  const { videoId, body } = await getVideoInfo(
+    `https://youtu.be/${ID}`,
+    fakeDataApi(requested),
+    "test-key",
+  );
+  assert.equal(videoId, ID);
+  assert.deepEqual([...requested].sort(), ["/youtube/v3/captions", "/youtube/v3/videos"]);
+  assert.match(body, /Title: A talk/);
+  assert.match(body, /Channel: A channel/);
+  assert.match(body, /Duration: 1:01:40/);
+  assert.match(body, /Published: 2024-05-01/);
+  assert.match(body, /Views: 12,345/);
+  assert.match(body, /Transcript languages: en \(auto\)/);
+  assert.match(body, /What the talk covers\./);
+});
+
+test("a caption-listing failure degrades one line, not the answer", async () => {
+  const { body } = await getVideoInfo(ID, fakeDataApi([], { captionsStatus: 403 }), "test-key");
+  assert.match(body, /Title: A talk/);
+  assert.match(body, /Transcript languages: \(could not be listed\)/);
+});
+
+test("a video the Data API does not list is named as missing", async () => {
+  await assert.rejects(
+    getVideoInfo(ID, fakeDataApi([], { videos: { items: [] } }), "test-key"),
+    /does not list this video/,
+  );
+});
+
+test("a Data API refusal carries the reason, never the key", async () => {
+  await assert.rejects(
+    getVideoInfo(ID, fakeDataApi([], { videosStatus: 403 }), "test-key"),
+    (error: unknown) => {
+      assert.ok(error instanceof YoutubeError);
+      assert.match(error.message, /403.*quotaExceeded/);
+      assert.doesNotMatch(error.message, /test-key/);
+      return true;
+    },
+  );
+});
