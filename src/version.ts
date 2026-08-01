@@ -9,4 +9,4 @@
  */
 
 export const SERVER_NAME = "mcp-youtube";
-export const SERVER_VERSION = "0.1.1";
+export const SERVER_VERSION = "0.2.0";
