@@ -73,7 +73,9 @@ curl -s localhost:3000/mcp -H 'content-type: application/json' -d '{
 
 ## Deploy
 
-The image is what ships (see `Dockerfile`; CI builds it on every push and
-publishes to ECR + GHCR on a `v*` tag). The intended deployment is a
-Deployment behind a ClusterIP in the `agent-mcps` namespace, beside its
-siblings `mcp-url-fetch` and `mcp-memory`.
+The image is what ships (see `Dockerfile`). CI builds it on every pull request
+and push to `main`; a `v*` tag publishes it to ECR + GHCR and then dispatches
+the released version to the GitOps repository (`opspresso/argocd-env-demo`),
+which rolls out the deploy. The intended deployment is a Deployment behind a
+ClusterIP in the `agent-mcps` namespace, beside its siblings `mcp-url-fetch`
+and `mcp-memory`.
