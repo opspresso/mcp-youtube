@@ -10,8 +10,9 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
-    "test": "node --import tsx --test src/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "version": "node scripts/sync-version.mjs && git add src/version.ts"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
