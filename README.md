@@ -35,12 +35,20 @@ it points anywhere else.
 
 ## Protocol
 
-MCP over plain HTTP (`POST /mcp`, JSON-RPC 2.0): `initialize`, `tools/list`,
-`tools/call`, `ping`. Stateless — `DELETE` (session teardown) is a 204, and
-notifications are accepted and dropped. Implemented directly rather than
-through an SDK, the same choice `mcp-url-fetch` made: the surface is four
-methods, and an SDK whose schema generation shifts underneath is the only
-dependency that has actually broken a server like this.
+MCP over plain HTTP (`POST /mcp`), served by `@modelcontextprotocol/server`.
+**Both protocol eras from one endpoint**: a client that opens with
+`server/discover` gets revision `2026-07-28`, and one that opens with the
+`initialize` handshake is served statelessly as before. Nothing here holds
+state between calls either way.
+
+The protocol used to be implemented here by hand, on the grounds that the
+surface was four JSON-RPC methods and an SDK whose schema generation shifts
+underneath is the dependency most likely to break a server like this. Revision
+`2026-07-28` ended that trade: it removed the handshake and added a per-request
+`_meta` envelope, `server/discover`, `resultType` on every result, the
+`ttlMs`/`cacheScope` hints the list verbs now require, `Mcp-Param-*` mirroring
+from a tool's own schema, and multi round-trip results. Four methods became a
+moving surface, and following it by hand is the larger risk now.
 
 `GET /health` answers `200 {"status":"ok"}` for probes.
 
