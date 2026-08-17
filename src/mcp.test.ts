@@ -16,7 +16,7 @@
 import { strict as assert } from "node:assert";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { after, before, describe, it } from "node:test";
+import { after, before, describe, it, mock } from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
@@ -96,5 +96,41 @@ describe("what a client is offered", () => {
     assert.equal(client.getProtocolEra(), "legacy");
     assert.equal((await client.listTools()).tools.length, 2);
     await client.close();
+  });
+});
+
+describe("the log", () => {
+  it("writes one line per call, with the id and never the input", async () => {
+    // An input with no id is refused before anything is fetched, which is what
+    // makes this callable offline — and a refusal is still a call.
+    const write = mock.method(console, "log", () => {});
+    const complain = mock.method(console, "error", () => {});
+    try {
+      const client = await connect();
+      const result = await client.callTool({
+        name: "get_transcript",
+        arguments: { url: "https://example.com/watch?secret=1" },
+      });
+      await client.close();
+      assert.equal(result.isError, true);
+
+      const lines = write.mock.calls
+        .map((call) => JSON.parse(String(call.arguments[0])) as Record<string, unknown>)
+        .filter((line) => line.event === "tool_call");
+      assert.equal(lines.length, 1);
+      assert.equal(lines[0]?.tool, "get_transcript");
+      assert.equal(lines[0]?.ok, false);
+      assert.equal(typeof lines[0]?.ms, "number");
+      assert.equal("videoId" in lines[0]!, false);
+
+      const failures = complain.mock.calls.map((call) => String(call.arguments[0]));
+      assert.equal(failures.length, 1);
+      assert.match(failures[0]!, /"event":"tool_failed"/);
+      // The raw input is the model's text; neither line repeats it.
+      assert.doesNotMatch(JSON.stringify([lines, failures]), /example\.com|secret/);
+    } finally {
+      write.mock.restore();
+      complain.mock.restore();
+    }
   });
 });

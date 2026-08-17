@@ -26,6 +26,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { authorizes, describeAuth } from "./auth.js";
+import { logError } from "./log.js";
 import { buildServer } from "./mcp.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 
@@ -34,7 +35,7 @@ const PORT = Number(process.env.PORT ?? 3000);
 const API_KEY = process.env.MCP_API_KEY;
 const mcp = toNodeHandler(
   createMcpHandler(buildServer, {
-    onerror: (error) => console.warn(`mcp: ${error.message}`),
+    onerror: (error) => logError("mcp_handler_failed", error),
   }),
 );
 

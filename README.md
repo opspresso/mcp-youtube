@@ -52,6 +52,18 @@ moving surface, and following it by hand is the larger risk now.
 
 `GET /health` answers `200 {"status":"ok"}` for probes.
 
+The process logs one JSON line per event. Every tool call leaves a `tool_call`
+line on stdout — the tool, the video id, how long it took and whether it
+answered (`ok`) — and a lookup that failed is written to stderr as well, with
+YouTube's reason, so "videos started failing on Tuesday" has evidence behind it:
+`warn` for a refusal the model can act on (no captions, not playable), `error`
+for a bug or a dependency failing. Neither carries the input or the transcript:
+the input is arbitrary text a model wrote, and the id is what a failure is
+identified by.
+
+    {"level":"info","event":"tool_call","tool":"get_transcript","videoId":"dQw4w9WgXcQ","ms":812,"ok":true}
+    {"level":"warn","event":"tool_failed","message":"…","tool":"get_transcript","videoId":"dQw4w9WgXcQ"}
+
 ## Configuration
 
 | Variable | Default | Meaning |

@@ -18,6 +18,7 @@
 
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { elapsedMs, logError, logInfo, logWarn } from "./log.js";
 import { getTranscript, getVideoInfo, watchUrl, YoutubeError, type ToolResult } from "./youtube.js";
 import { parseVideoId } from "./videoId.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
@@ -63,20 +64,32 @@ function describe(error: unknown): string {
  * back as a tool error rather than a protocol one — the model can try another
  * link or ask for a different language, where a JSON-RPC error just ends the
  * call.
+ *
+ * Every call leaves one line behind, whatever the outcome — the tool, the
+ * video, how long it took and whether it answered. The id, not the input: the
+ * raw input is arbitrary text a model wrote, and `log.ts` says why it never
+ * reaches a log line.
  */
 async function lookup(
   url: string,
   run: () => Promise<ToolResult>,
   tool: string,
 ): Promise<{ content: [{ type: "text"; text: string }]; isError?: true }> {
+  const started = performance.now();
+  const videoId = parseVideoId(url) ?? undefined;
+  let ok = false;
   try {
-    return { content: [{ type: "text", text: asUntrustedContent(await run()) }] };
+    const result = await run();
+    ok = true;
+    return { content: [{ type: "text", text: asUntrustedContent(result) }] };
   } catch (error) {
     const reason = error instanceof YoutubeError ? error.message : describe(error);
-    // The id, not the input: the log line answers "videos started failing on
-    // Tuesday", and the raw input is arbitrary text a model wrote.
-    console.warn(`${tool} failed: ${parseVideoId(url) ?? "(unrecognised input)"} — ${reason}`);
+    // The caller is told; without this line the operator is not, and a video
+    // that started failing has no evidence behind it anywhere.
+    (error instanceof YoutubeError ? logWarn : logError)("tool_failed", error, { tool, videoId });
     return toolError(`Error: ${reason}`);
+  } finally {
+    logInfo("tool_call", { tool, videoId, ms: elapsedMs(started), ok });
   }
 }
 
