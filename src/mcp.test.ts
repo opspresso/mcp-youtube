@@ -80,7 +80,7 @@ describe("what a client is offered", () => {
   });
 
   it("serves a client that opens with the 2026-07-28 probe", async () => {
-    // The era AgentDure speaks, and the reason this server moved to the SDK.
+    // The era Agent Studio speaks, and the reason this server moved to the SDK.
     const client = await connect("auto");
 
     assert.equal(client.getProtocolEra(), "modern");
