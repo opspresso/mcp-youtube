@@ -52,6 +52,9 @@ moving surface, and following it by hand is the larger risk now.
 
 `GET /health` answers `200 {"status":"ok"}` for probes.
 
+The MCP endpoint has no browser caller. Requests carrying an `Origin` header
+are refused with 403, as required by the Streamable HTTP DNS-rebinding guard.
+
 The process logs one JSON line per event. Every tool call leaves a `tool_call`
 line on stdout — the tool, the video id, how long it took and whether it
 answered (`ok`) — and a lookup that failed is written to stderr as well, with

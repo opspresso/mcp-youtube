@@ -25,7 +25,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
-import { authorizes, describeAuth } from "./auth.js";
+import { authorizes, authorizesOrigin, describeAuth } from "./auth.js";
 import { logError } from "./log.js";
 import { buildServer } from "./mcp.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
@@ -57,14 +57,23 @@ const server = createServer((request, response) => {
       send(response, 200, { status: "ok" });
       return;
     }
-    if (!path.startsWith("/mcp")) {
+    if (path !== "/mcp") {
       send(response, 404, { error: "not found" });
+      return;
+    }
+    if (!authorizesOrigin(request.headers.origin)) {
+      send(response, 403, {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32002, message: "browser origins are not allowed" },
+      });
       return;
     }
     // Ahead of the handler, because the shared secret is this deployment's
     // gate rather than the protocol's: an unauthorized caller should not reach
     // the point where a server instance is built for it.
     if (!authorized(request)) {
+      response.setHeader("www-authenticate", 'Bearer realm="mcp"');
       send(response, 401, {
         jsonrpc: "2.0",
         id: null,
